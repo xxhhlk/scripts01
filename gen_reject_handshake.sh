@@ -14,8 +14,9 @@
 #
 # 说明:
 #   - 容器名前缀为 1Panel-openresty-（后缀随机），脚本自动用 docker ps 匹配。
-#   - 若某端口在现有站点配置里已经声明了 default_server，则跳过该端口，
-#     避免 "a duplicate default server" 导致 nginx 启动/重载失败。
+#   - 按网络栈（IPv4 / IPv6）分别兜底：仅对确实存在非回环监听的栈生成 default_server，
+#     回环监听（127.0.0.1 / [::1]）所在栈不兜底。若某栈的通配地址已声明 default_server，
+#     则跳过该栈，避免 "a duplicate default server" 导致 nginx 启动/重载失败。
 #   - 若容器不支持 IPv6，生成的 listen [::]:port 行会让 openresty -t 失败；
 #     此时脚本会中止重载，运行中的服务不受影响，你可按提示注释掉 IPv6 行。
 # ------------------------------------------------------------------
@@ -59,8 +60,10 @@ find "$CONF_DIR" -type f -name '*.conf' ! -name "${GEN_NAME}*" -print0 \
     done > "$TMP_LISTEN"
 
 # ---------- 解析端口 ----------
-declare -A SEEN
-declare -A HAS_DEFAULT
+declare -A V4          # port -> 1 : 存在非回环的 IPv4 监听（裸端口=0.0.0.0 通配 / 0.0.0.0 / 公网 IP）
+declare -A V6          # port -> 1 : 存在非回环的 IPv6 监听（[::] 通配 / 公网 IPv6）
+declare -A DEF_V4      # port -> 1 : IPv4 通配地址上已声明 default_server（跳过该栈避免冲突）
+declare -A DEF_V6      # port -> 1 : IPv6 通配地址([::])上已声明 default_server（跳过该栈避免冲突）
 
 extract_port() {
   # $1: 完整的 listen 指令行（可能带前导空白/缩进）
@@ -115,7 +118,7 @@ while IFS= read -r line; do
   addr="$(extract_addr "$line")"
   if is_loopback "$addr"; then
     # 仅监听本地回环（127.0.0.1 / [::1] / localhost），外部不可达，
-    # 无需防泄露兜底，且避免与站点自身的回环监听冲突
+    # 该网络栈无需防泄露兜底，也避免与站点自身的回环监听冲突
     continue
   fi
 
@@ -125,11 +128,25 @@ while IFS= read -r line; do
     continue
   fi
 
-  SEEN["$port"]=1
-  if [[ "$lower" == *"default_server"* ]]; then
-    HAS_DEFAULT["$port"]=1
+  if [[ "$addr" == *:* ]]; then
+    # IPv6 监听（含 [::] 通配、公网 IPv6）；能到这里说明已非回环
+    V6["$port"]=1
+    # 仅在 IPv6 通配地址([::])上已声明 default_server 时跳过该栈，避免 duplicate default server
+    if [[ "$lower" == *"default_server"* && "$addr" == "::" ]]; then
+      DEF_V6["$port"]=1
+    fi
+  else
+    # IPv4 监听（裸端口=0.0.0.0 通配 / 0.0.0.0 / 公网 IP）；能到这里说明已非回环
+    V4["$port"]=1
+    if [[ "$lower" == *"default_server"* && ( "$addr" == "" || "$addr" == "0.0.0.0" ) ]]; then
+      DEF_V4["$port"]=1
+    fi
   fi
 done < "$TMP_LISTEN"
+
+# 汇总所有需兜底的端口（IPv4 或 IPv6 任一栈存在非回环监听即纳入）
+PORT_LIST="$( { printf '%s\n' "${!V4[@]}"; printf '%s\n' "${!V6[@]}"; } | sort -n -u )"
+PORT_COUNT="$(printf '%s\n' "$PORT_LIST" | grep -c .)"
 
 # ---------- 拼装生成内容 ----------
 GEN=""
@@ -138,24 +155,30 @@ GEN+="# 自动生成的防泄漏兜底配置 (使用 ssl_reject_handshake)"$'\n'
 GEN+="# 当用 IP 直接访问这些端口时，直接拒绝 TLS 握手，彻底隐藏真实证书"$'\n'
 GEN+="# 集成 http2 与 TLSv1.3，兼容 REALITY 偷自己域名的指纹提取"$'\n'
 GEN+="# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')"$'\n'
-GEN+="# 扫描到 SSL 端口数: ${#SEEN[@]}"$'\n'
+GEN+="# 扫描到 SSL 端口数: ${PORT_COUNT}"$'\n'
 GEN+="# ========================================="$'\n'
 
-PORT_LIST="$(printf '%s\n' "${!SEEN[@]}" | sort -n)"
+PORT_LIST="$( { printf '%s\n' "${!V4[@]}"; printf '%s\n' "${!V6[@]}"; } | sort -n -u )"
 
 if [[ -z "$PORT_LIST" ]]; then
-  GEN+=$'\n'"# 未扫描到任何 listen ssl 的端口，配置为空。"$'\n'
+  GEN+=$'\n'"# 未扫描到任何 listen ssl 的非回环端口，配置为空。"$'\n'
 else
   while IFS= read -r port; do
     [[ -z "$port" ]] && continue
-    if [[ -n "${HAS_DEFAULT[$port]+x}" ]]; then
-      GEN+=$'\n'"# 端口 $port 已有站点声明 default_server，跳过以免冲突"$'\n'
-      continue
+    # 逐栈兜底：仅对确实存在非回环监听、且通配地址上尚无 default_server 的网络栈生成
+    srv=""
+    if [[ -n "${V4[$port]+x}" && -z "${DEF_V4[$port]+x}" ]]; then
+      srv+="    listen ${port} ssl http2 default_server;"$'\n'
     fi
+    if [[ -n "${V6[$port]+x}" && -z "${DEF_V6[$port]+x}" ]]; then
+      srv+="    listen [::]:${port} ssl http2 default_server;"$'\n'
+    fi
+    # 两个栈都因已有 default_server 而跳过时不生成空 server 块
+    [[ -z "$srv" ]] && continue
+
     GEN+=$'\n'
     GEN+="server {"$'\n'
-    GEN+="    listen ${port} ssl http2 default_server;"$'\n'
-    GEN+="    listen [::]:${port} ssl http2 default_server;"$'\n'
+    GEN+="$srv"
     GEN+="    server_name _;"$'\n'
     GEN+=$'\n'
     GEN+="    # 必须显式声明协议，防止 SNI 路由前上下文降级，兼容 REALITY 透传探测"$'\n'
@@ -185,7 +208,7 @@ if [[ -f "$OUT_FILE" ]]; then
 fi
 
 printf '%s' "$GEN" > "$OUT_FILE"
-echo "已生成: $OUT_FILE  (共 ${#SEEN[@]} 个 SSL 端口)"
+echo "已生成: $OUT_FILE  (共 ${PORT_COUNT} 个 SSL 端口)"
 
 if [[ "$NO_RELOAD" -eq 1 ]]; then
   echo "已跳过重载 (--no-reload)"
