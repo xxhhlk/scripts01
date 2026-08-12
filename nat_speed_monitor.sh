@@ -68,6 +68,7 @@ declare -a WIN_RX=() WIN_TX=()
 declare -i WIN_IDX=0
 declare -i HIGH_COUNT=0   # UNKNOWN 采集期高于阈值的秒数
 LAST_TRIG_TS=0            # 上次 TRIG 日志时间戳(秒)，用于冷却抑制
+LAST_CACHE_TS=0           # 上次 CACHE 跳过复测日志时间戳(秒)，用于冷却抑制
 PREV_RX=0 PREV_TX=0
 
 # ===== 工具函数 =====
@@ -79,6 +80,16 @@ trig_log() {
   now=$(date +%s)
   if [ $(( now - LAST_TRIG_TS )) -ge "$TRIG_COOLDOWN" ]; then
     LAST_TRIG_TS=$now
+    log "$*"
+  fi
+}
+
+# ===== CACHE 跳过复测日志冷却抑制 (TRIG_COOLDOWN 秒内只记录一次) =====
+cache_log() {
+  local now
+  now=$(date +%s)
+  if [ $(( now - LAST_CACHE_TS )) -ge "$TRIG_COOLDOWN" ]; then
+    LAST_CACHE_TS=$now
     log "$*"
   fi
 }
@@ -399,7 +410,7 @@ while true; do
       log "[CACHE] 复测缓存命中 (限速, $(( $(date +%s) - LAST_PROBE_TS ))s前)，直接停止"
       do_stop
     elif probe_cache_valid; then
-      log "[CACHE] 缓存有效 (${LAST_PROBE_RESULT}, $(( $(date +%s) - LAST_PROBE_TS ))s前)，跳过复测"
+      cache_log "[CACHE] 缓存有效 (${LAST_PROBE_RESULT}, $(( $(date +%s) - LAST_PROBE_TS ))s前)，跳过复测"
     else
       wget_probe
       wget_rc=$?
@@ -436,7 +447,7 @@ while true; do
       LAST_PROBE_TS=$(date +%s)
       do_start
     elif probe_cache_valid; then
-      log "[CACHE] 缓存有效 (${LAST_PROBE_RESULT}, $(( $(date +%s) - LAST_PROBE_TS ))s前)，跳过复测"
+      cache_log "[CACHE] 缓存有效 (${LAST_PROBE_RESULT}, $(( $(date +%s) - LAST_PROBE_TS ))s前)，跳过复测"
     else
       wget_probe
       wget_rc=$?
