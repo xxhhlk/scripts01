@@ -80,12 +80,45 @@ extract_port() {
   printf '%s' "$port"
 }
 
+extract_addr() {
+  # $1: 完整的 listen 指令行；返回绑定地址（裸端口/无具体地址则返回空串）
+  local rest="$1"
+  rest="${rest%%;*}"                                  # 去掉行尾分号及之后
+  rest="${rest#"${rest%%[![:space:]]*}"}"             # 去掉前导空白（缩进）
+  rest="${rest#listen}"                               # 去掉 listen 关键字
+  rest="${rest#"${rest%%[![:space:]]*}"}"             # 去掉 listen 之后的前导空白
+  local addr=""
+  if [[ "$rest" == \[* ]]; then
+    addr="${rest#\[}"                                 # IPv6：[addr]:port
+    addr="${addr%%\]*}"
+  elif [[ "$rest" == *:* ]]; then
+    addr="${rest%%:*}"                                # IPv4：addr:port
+  else
+    addr=""                                           # 裸端口：绑定所有接口
+  fi
+  printf '%s' "$addr"
+}
+
+is_loopback() {
+  # $1: 绑定地址；回环地址返回 0，否则返回 1
+  case "$1" in
+    127.0.0.1|::1|localhost) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
   lower="$(printf '%s' "$line" | tr 'A-Z' 'a-z')"
   [[ "$lower" != *"ssl"* ]] && continue              # 只处理含 ssl 的 listen
 
-  rest="${line#listen}"
+  addr="$(extract_addr "$line")"
+  if is_loopback "$addr"; then
+    # 仅监听本地回环（127.0.0.1 / [::1] / localhost），外部不可达，
+    # 无需防泄露兜底，且避免与站点自身的回环监听冲突
+    continue
+  fi
+
   port="$(extract_port "$line")"
   [[ -z "$port" ]] && continue
   if (( port < 1 || port > 65535 )); then
