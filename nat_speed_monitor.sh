@@ -19,13 +19,14 @@ URL='https://aliyun-client-assist.oss-accelerate.aliyuncs.com/client/releases/wi
 THRESHOLD_KBPS=200          # wget 复测带宽阈值 (KB/s)
 FLOW_THRESHOLD_KBPS=300     # 真实流量每方向每秒阈值 (KB/s)
 SAMPLE_INTERVAL=2           # 采样间隔 (秒)
-WINDOW_TIME=30              # 滑动窗口时间长度 (秒)，会自动换算为采样点数
-PROBE_VALID_NORMAL=60       # 正常结果缓存有效期 (秒)
+WINDOW_TIME=60              # 滑动窗口时间长度 (秒)，会自动换算为采样点数
+PROBE_VALID_NORMAL=100       # 正常结果缓存有效期 (秒)
 PROBE_VALID_THROTTLED=300   # 限速结果缓存有效期 (秒)
 HIGH_THRESHOLD_PEAK=3       # 高峰时段窗口中需高于流量阈值的秒数
 HIGH_THRESHOLD_OFFPEAK=1    # 低谷时段窗口中需高于流量阈值的秒数
 # 低谷时间: 工作日 1:00~7:00, 周末 2:00~8:00
 DURATION=3                  # wget 下载探测秒数
+TRIG_COOLDOWN=60            # 同类型 TRIG 提示冷却时间(秒)，防止低流量常态下刷屏
 LOG_FILE='/var/log/nat_speed_monitor.log'
 DRY_RUN="${DRY_RUN:-0}"
 MODE="${MODE:-daemon}"
@@ -38,6 +39,7 @@ WINDOW_SAMPLES=$((WINDOW_TIME / SAMPLE_INTERVAL))  # 窗口采样点数
 #   x-ui    -> x-ui stop / x-ui start (name 留空)
 TARGETS=(
   "systemd:nat.service"
+  "systemd:uinetd.service"
   "systemd:hentaihome.service"
   "1pctl:"
   "docker:1Panel-openresty-RoFl"
@@ -65,10 +67,21 @@ LAST_PROBE_TS=0                       # epoch seconds
 declare -a WIN_RX=() WIN_TX=()
 declare -i WIN_IDX=0
 declare -i HIGH_COUNT=0   # UNKNOWN 采集期高于阈值的秒数
+LAST_TRIG_TS=0            # 上次 TRIG 日志时间戳(秒)，用于冷却抑制
 PREV_RX=0 PREV_TX=0
 
 # ===== 工具函数 =====
 log() { echo "$(date '+%F %T') $*" >> "$LOG_FILE"; }
+
+# ===== TRIG 日志冷却抑制 (TRIG_COOLDOWN 秒内同类型只记录一次) =====
+trig_log() {
+  local now
+  now=$(date +%s)
+  if [ $(( now - LAST_TRIG_TS )) -ge "$TRIG_COOLDOWN" ]; then
+    LAST_TRIG_TS=$now
+    log "$*"
+  fi
+}
 
 # ===== 对单个目标执行 stop/start =====
 apply_one() {
@@ -380,7 +393,7 @@ while true; do
 
   # ----- NORMAL 状态：两个方向窗口都全低速 → 疑似限速 -----
   elif [ "$STATE" = "NORMAL" ] && win_all_below WIN_RX && win_all_below WIN_TX; then
-    log "[TRIG] 双向窗口 30s 全低速 (高速0/30)，疑似限速"
+    trig_log "[TRIG] 双向窗口 30s 全低速 (高速0/30)，疑似限速"
 
     if probe_cache_hit 'throttled'; then
       log "[CACHE] 复测缓存命中 (限速, $(( $(date +%s) - LAST_PROBE_TS ))s前)，直接停止"
@@ -412,7 +425,7 @@ while true; do
   # ----- STOPPED 状态：任一方向窗口出现高速 → 疑似恢复 -----
   elif [ "$STATE" = "STOPPED" ] && ( win_any_above WIN_RX || win_any_above WIN_TX ); then
     HIGH_CNT=$(win_high_count)
-    log "[TRIG] 窗口出现高速 (${HIGH_CNT}/30 次 >${FLOW_THRESHOLD_KBPS} KB/s)，疑似恢复"
+    trig_log "[TRIG] 窗口出现高速 (${HIGH_CNT}/30 次 >${FLOW_THRESHOLD_KBPS} KB/s)，疑似恢复"
 
     if probe_cache_hit 'normal'; then
       log "[CACHE] 复测缓存命中 (正常, $(( $(date +%s) - LAST_PROBE_TS ))s前)，直接启动"
