@@ -2,9 +2,9 @@
 #
 # gen_reject_handshake.sh
 # ------------------------------------------------------------------
-# 自动扫描 1Panel OpenResty 网站配置中所有 "listen ... ssl" 的端口，
-# 为每个端口生成一份 default_server 兜底配置（ssl_reject_handshake），
-# 用 IP 直接访问这些端口时直接拒绝 TLS 握手，彻底隐藏真实证书。
+# 自动扫描 1Panel OpenResty 网站配置中所有 "listen ... ssl" 的监听，
+# 为每一个 "listen <地址>:<端口> ssl" 生成同地址同端口的 default_server 兜底配置
+# （ssl_reject_handshake），IP 直连这些地址/端口时直接拒绝 TLS 握手，彻底隐藏真实证书。
 # 生成后自动在 OpenResty 容器内做配置测试并热重载。
 #
 # 用法:
@@ -14,11 +14,12 @@
 #
 # 说明:
 #   - 容器名前缀为 1Panel-openresty-（后缀随机），脚本自动用 docker ps 匹配。
-#   - 按网络栈（IPv4 / IPv6）分别兜底：仅对确实存在非回环监听的栈生成 default_server，
-#     回环监听（127.0.0.1 / [::1]）所在栈不兜底。若某栈的通配地址已声明 default_server，
-#     则跳过该栈，避免 "a duplicate default server" 导致 nginx 启动/重载失败。
-#   - 若容器不支持 IPv6，生成的 listen [::]:port 行会让 openresty -t 失败；
-#     此时脚本会中止重载，运行中的服务不受影响，你可按提示注释掉 IPv6 行。
+#   - 1:1 精确兜底：为每一个 "listen <地址>:<端口> ssl" 生成同地址同端口的
+#     default_server 兜底块（含回环地址，如 127.0.0.1 / [::1]）。监听什么地址就兜底什么地址，
+#     不会额外新增该端口在其它地址上的兜底。原样保留 socket 级选项（如 proxy_protocol）。
+#   - 若某地址在原配置里已声明 default_server，则跳过该地址，避免 "a duplicate default server"。
+#   - 若容器不支持 IPv6，生成的 listen [::]:... 行会让 openresty -t 失败；
+#     此时脚本会中止重载，运行中的服务不受影响，你可按提示注释掉对应行。
 # ------------------------------------------------------------------
 
 set -uo pipefail
@@ -59,126 +60,118 @@ find "$CONF_DIR" -type f -name '*.conf' ! -name "${GEN_NAME}*" -print0 \
       grep -iE '^[[:space:]]*listen[[:space:]]' "$f" 2>/dev/null
     done > "$TMP_LISTEN"
 
-# ---------- 解析端口 ----------
-declare -A V4          # port -> 1 : 存在非回环的 IPv4 监听（裸端口=0.0.0.0 通配 / 0.0.0.0 / 公网 IP）
-declare -A V6          # port -> 1 : 存在非回环的 IPv6 监听（[::] 通配 / 公网 IPv6）
-declare -A DEF_V4      # port -> 1 : IPv4 通配地址上已声明 default_server（跳过该栈避免冲突）
-declare -A DEF_V6      # port -> 1 : IPv6 通配地址([::])上已声明 default_server（跳过该栈避免冲突）
+# ---------- 解析 listen 指令 ----------
+# 语义：监听什么地址就兜底什么地址（1:1 精确兜底）。
+# 为每一个 "listen <地址>:<端口> ssl" 生成同地址同端口的 default_server 兜底块，
+# 原样保留 socket 级选项（如 proxy_protocol），不再忽略回环地址。
 
-extract_port() {
-  # $1: 完整的 listen 指令行（可能带前导空白/缩进）
-  local rest="$1"
-  rest="${rest%%;*}"                                  # 去掉行尾分号及之后
-  rest="${rest#"${rest%%[![:space:]]*}"}"             # 去掉前导空白（缩进）
-  rest="${rest#listen}"                               # 去掉 listen 关键字
-  rest="${rest#"${rest%%[![:space:]]*}"}"             # 去掉 listen 之后的前导空白
+split_listen() {
+  # $1: 完整 listen 指令行
+  # 输出: addrport|port|extra_flags|has_default
+  local raw="$1"
+  raw="${raw%%;*}"                                  # 去掉分号及之后
+  raw="${raw#"${raw%%[![:space:]]*}"}"              # 去前导空白
+  raw="${raw#listen}"                               # 去掉 listen 关键字
+  raw="${raw#"${raw%%[![:space:]]*}"}"              # 去掉 listen 后的前导空白
+  local first="${raw%%[[:space:]]*}"                # 首个 token = 地址:端口
+  local rest="${raw#"$first"}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"            # 其余 token
   local port
-  if [[ "$rest" == *:* ]]; then
-    port="${rest##*:}"                                # 取最后一个冒号之后的内容
+  if [[ "$first" == *:* ]]; then
+    port="${first##*:}"                             # 取最后一个冒号后内容（兼容 IPv6 多冒号）
   else
-    port="${rest%%[[:space:]]*}"                      # 否则取首个 token
+    port="$first"
   fi
-  port="${port%%[[:space:]]*}"                        # 去掉端口后可能跟的 "ssl http2" 等
-  port="${port//[^0-9]/}"                             # 只保留数字
-  printf '%s' "$port"
+  port="${port//[^0-9]/}"                           # 只保留数字（unix socket 会得到空）
+  local flags="" has_def=0 tok
+  for tok in $rest; do
+    case "$tok" in
+      ssl|http2|default_server|default) : ;;        # 由脚本统一生成/忽略
+      *) flags="${flags:+$flags }$tok" ;;            # 保留 socket 级选项（proxy_protocol 等）
+    esac
+    case "$tok" in
+      default_server|default) has_def=1 ;;
+    esac
+  done
+  printf '%s|%s|%s|%s' "$first" "$port" "$flags" "$has_def"
 }
 
-extract_addr() {
-  # $1: 完整的 listen 指令行；返回绑定地址（裸端口/无具体地址则返回空串）
-  local rest="$1"
-  rest="${rest%%;*}"                                  # 去掉行尾分号及之后
-  rest="${rest#"${rest%%[![:space:]]*}"}"             # 去掉前导空白（缩进）
-  rest="${rest#listen}"                               # 去掉 listen 关键字
-  rest="${rest#"${rest%%[![:space:]]*}"}"             # 去掉 listen 之后的前导空白
-  local addr=""
-  if [[ "$rest" == \[* ]]; then
-    addr="${rest#\[}"                                 # IPv6：[addr]:port
-    addr="${addr%%\]*}"
-  elif [[ "$rest" == *:* ]]; then
-    addr="${rest%%:*}"                                # IPv4：addr:port
-  else
-    addr=""                                           # 裸端口：绑定所有接口
-  fi
-  printf '%s' "$addr"
-}
-
-is_loopback() {
-  # $1: 绑定地址；回环地址返回 0，否则返回 1
-  case "$1" in
-    127.0.0.1|::1|localhost) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+declare -A PORT_ADDRS   # port -> "addrport1 addrport2 ..."（同端口下的监听地址，去重）
+declare -A ADDR_FLAGS   # "addrport" -> 需保留的额外 socket 选项（如 proxy_protocol）
+declare -A ADDR_DEF     # "addrport" -> 1 表示原配置已声明 default_server（跳过以免冲突）
 
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
   lower="$(printf '%s' "$line" | tr 'A-Z' 'a-z')"
-  [[ "$lower" != *"ssl"* ]] && continue              # 只处理含 ssl 的 listen
+  [[ "$lower" != *"ssl"* ]] && continue              # 只处理含 ssl 的 listen（非 ssl 不会泄露证书）
 
-  addr="$(extract_addr "$line")"
-  if is_loopback "$addr"; then
-    # 仅监听本地回环（127.0.0.1 / [::1] / localhost），外部不可达，
-    # 该网络栈无需防泄露兜底，也避免与站点自身的回环监听冲突
+  IFS='|' read -r LP_ADDRPORT LP_PORT LP_FLAGS LP_DEF <<< "$(split_listen "$line")"
+  [[ -z "$LP_PORT" ]] && continue                    # unix socket 等无端口，跳过
+  if (( LP_PORT < 1 || LP_PORT > 65535 )); then
     continue
   fi
 
-  port="$(extract_port "$line")"
-  [[ -z "$port" ]] && continue
-  if (( port < 1 || port > 65535 )); then
-    continue
+  if [[ "$LP_DEF" == "1" ]]; then
+    ADDR_DEF["$LP_ADDRPORT"]=1
   fi
 
-  if [[ "$addr" == *:* ]]; then
-    # IPv6 监听（含 [::] 通配、公网 IPv6）；能到这里说明已非回环
-    V6["$port"]=1
-    # 仅在 IPv6 通配地址([::])上已声明 default_server 时跳过该栈，避免 duplicate default server
-    if [[ "$lower" == *"default_server"* && "$addr" == "::" ]]; then
-      DEF_V6["$port"]=1
+  if [[ -z "${ADDR_FLAGS[$LP_ADDRPORT]+x}" ]]; then
+    # 首次见到该地址：登记并挂到对应端口
+    ADDR_FLAGS["$LP_ADDRPORT"]="$LP_FLAGS"
+    if [[ -z "${PORT_ADDRS[$LP_PORT]+x}" ]]; then
+      PORT_ADDRS["$LP_PORT"]="$LP_ADDRPORT"
+    elif [[ " ${PORT_ADDRS[$LP_PORT]} " != *" $LP_ADDRPORT "* ]]; then
+      PORT_ADDRS["$LP_PORT"]+=" $LP_ADDRPORT"
     fi
   else
-    # IPv4 监听（裸端口=0.0.0.0 通配 / 0.0.0.0 / 公网 IP）；能到这里说明已非回环
-    V4["$port"]=1
-    if [[ "$lower" == *"default_server"* && ( "$addr" == "" || "$addr" == "0.0.0.0" ) ]]; then
-      DEF_V4["$port"]=1
-    fi
+    # 已见过：仅合并可能新增的 socket 选项（default 等已由 split 排除）
+    for f in $LP_FLAGS; do
+      if [[ " ${ADDR_FLAGS[$LP_ADDRPORT]} " != *" $f "* ]]; then
+        ADDR_FLAGS["$LP_ADDRPORT"]+=" $f"
+      fi
+    done
   fi
 done < "$TMP_LISTEN"
 
-# 汇总所有需兜底的端口（IPv4 或 IPv6 任一栈存在非回环监听即纳入）
-PORT_LIST="$( { printf '%s\n' "${!V4[@]}"; printf '%s\n' "${!V6[@]}"; } | sort -n -u )"
-PORT_COUNT="$(printf '%s\n' "$PORT_LIST" | grep -c .)"
+PORT_LIST="$(printf '%s\n' "${!PORT_ADDRS[@]}" | sort -n)"
+
+# 统计需兜底的监听地址数（已 default_server 的地址不计入）
+COUNT=0
+for p in "${!PORT_ADDRS[@]}"; do
+  for ap in ${PORT_ADDRS[$p]}; do
+    [[ -z "${ADDR_DEF[$ap]+x}" ]] && COUNT=$((COUNT+1))
+  done
+done
 
 # ---------- 拼装生成内容 ----------
 GEN=""
 GEN+="# ========================================="$'\n'
 GEN+="# 自动生成的防泄漏兜底配置 (使用 ssl_reject_handshake)"$'\n'
-GEN+="# 当用 IP 直接访问这些端口时，直接拒绝 TLS 握手，彻底隐藏真实证书"$'\n'
-GEN+="# 集成 http2 与 TLSv1.3，兼容 REALITY 偷自己域名的指纹提取"$'\n'
+GEN+="# 监听什么地址就兜底什么地址：为每个 listen <addr>:<port> ssl 生成同地址同端口的"$'\n'
+GEN+="# default_server 兜底块；IP 直连这些地址/端口时直接拒绝 TLS 握手，彻底隐藏真实证书。"$'\n'
+GEN+="# 集成 http2，兼容 REALITY 偷自己域名的指纹提取。"$'\n'
 GEN+="# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')"$'\n'
-GEN+="# 扫描到 SSL 端口数: ${PORT_COUNT}"$'\n'
+GEN+="# 需兜底的监听地址数: ${COUNT}"$'\n'
 GEN+="# ========================================="$'\n'
 
-PORT_LIST="$( { printf '%s\n' "${!V4[@]}"; printf '%s\n' "${!V6[@]}"; } | sort -n -u )"
-
-if [[ -z "$PORT_LIST" ]]; then
-  GEN+=$'\n'"# 未扫描到任何 listen ssl 的非回环端口，配置为空。"$'\n'
+if [[ "$COUNT" -eq 0 ]]; then
+  GEN+=$'\n'"# 未扫描到任何需兜底的 listen ssl 配置，配置为空。"$'\n'
 else
   while IFS= read -r port; do
     [[ -z "$port" ]] && continue
-    # 逐栈兜底：仅对确实存在非回环监听、且通配地址上尚无 default_server 的网络栈生成
-    srv=""
-    if [[ -n "${V4[$port]+x}" && -z "${DEF_V4[$port]+x}" ]]; then
-      srv+="    listen ${port} ssl http2 default_server;"$'\n'
-    fi
-    if [[ -n "${V6[$port]+x}" && -z "${DEF_V6[$port]+x}" ]]; then
-      srv+="    listen [::]:${port} ssl http2 default_server;"$'\n'
-    fi
-    # 两个栈都因已有 default_server 而跳过时不生成空 server 块
-    [[ -z "$srv" ]] && continue
-
+    listens=""
+    for ap in ${PORT_ADDRS[$port]}; do
+      if [[ -n "${ADDR_DEF[$ap]+x}" ]]; then
+        GEN+=$'\n'"# 地址 $ap 已声明 default_server，跳过以免冲突"$'\n'
+        continue
+      fi
+      extra="${ADDR_FLAGS[$ap]}"
+      listens+="    listen ${ap} ssl http2 default_server${extra:+ $extra};"$'\n'
+    done
+    [[ -z "$listens" ]] && continue
     GEN+=$'\n'
     GEN+="server {"$'\n'
-    GEN+="$srv"
+    GEN+="$listens"
     GEN+="    server_name _;"$'\n'
     GEN+=$'\n'
     GEN+="    # 必须显式声明协议，防止 SNI 路由前上下文降级，兼容 REALITY 透传探测"$'\n'
@@ -196,7 +189,16 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "===== DRY RUN: 以下内容将写入 $OUT_FILE ====="
   printf '%s' "$GEN"
   echo
-  echo "===== 发现的 SSL 端口: $(printf '%s ' $PORT_LIST) ====="
+  echo "===== 需兜底的监听地址 (${COUNT}): ====="
+  for p in $PORT_LIST; do
+    for ap in ${PORT_ADDRS[$p]}; do
+      if [[ -z "${ADDR_DEF[$ap]+x}" ]]; then
+        echo "  $ap"
+      else
+        echo "  $ap  (已 default_server，跳过)"
+      fi
+    done
+  done
   exit 0
 fi
 
@@ -208,7 +210,7 @@ if [[ -f "$OUT_FILE" ]]; then
 fi
 
 printf '%s' "$GEN" > "$OUT_FILE"
-echo "已生成: $OUT_FILE  (共 ${PORT_COUNT} 个 SSL 端口)"
+echo "已生成: $OUT_FILE  (共 ${COUNT} 个监听地址兜底)"
 
 if [[ "$NO_RELOAD" -eq 1 ]]; then
   echo "已跳过重载 (--no-reload)"
