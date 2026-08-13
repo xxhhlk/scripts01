@@ -86,7 +86,7 @@ split_listen() {
   local flags="" has_def=0 tok
   for tok in $rest; do
     case "$tok" in
-      ssl|http2|default_server|default) : ;;        # 由脚本统一生成/忽略
+      ssl|http2|default_server|default|reuseport) : ;;  # 由脚本统一生成/忽略；reuseport 是 per-socket 选项不可重复
       *) flags="${flags:+$flags }$tok" ;;            # 保留 socket 级选项（proxy_protocol 等）
     esac
     case "$tok" in
