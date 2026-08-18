@@ -12,18 +12,28 @@
 #   DRY_RUN=1 .../nat_speed_monitor.sh             # 只记录动作，不真正执行
 #   MODE=start .../nat_speed_monitor.sh            # 一次性手动启动所有目标并退出
 #
+# 环境变量:
+#   NAT_MON_TARGETS      受控目标列表 (空格分隔, 格式 "type:name"), 必须设置, 无默认值
+#                        例: NAT_MON_TARGETS="systemd:nat.service docker:iptv-rust 1pctl:"
+#   NAT_MON_LIMIT_TARGET 限速特例目标 (留空则关闭该特例, 无默认值)
+#   NAT_MON_LIMIT_KBIT   限速特例上行速率 (kbit/s, 默认 40)
+#   NAT_MON_LIMIT_DOWN_KBIT 限速特例下行速率 (kbit/s, 默认 40)
+#   PUBIP_FALLBACK       在线获取公网IP失败时的回退地址 (无默认值, 不设置且获取失败则退出)
+#   DRY_RUN=1            只记录动作, 不真正执行
+#   MODE=start           一次性手动启动所有目标并退出
+#
 set -u
 
 # ===== 配置 =====
 URL='https://aliyun-client-assist.oss-accelerate.aliyuncs.com/client/releases/win32/x64/alibaba-cloud-client-latest.exe?spm=a2c4g.11186623.0.0.2a784f2eAiRpmW&file=alibaba-cloud-client-latest.exe'
 THRESHOLD_KBPS=200          # wget 复测带宽阈值 (KB/s)
-FLOW_THRESHOLD_KBPS=300     # 真实流量每方向每秒阈值 (KB/s)
+FLOW_THRESHOLD_KBPS=200     # 真实流量每方向每秒阈值 (KB/s)
 SAMPLE_INTERVAL=2           # 采样间隔 (秒)
 WINDOW_TIME=60              # 滑动窗口时间长度 (秒)，会自动换算为采样点数
-PROBE_VALID_NORMAL=100       # 正常结果缓存有效期 (秒)
-PROBE_VALID_THROTTLED=300   # 限速结果缓存有效期 (秒)
-HIGH_THRESHOLD_PEAK=3       # 高峰时段窗口中需高于流量阈值的秒数
-HIGH_THRESHOLD_OFFPEAK=1    # 低谷时段窗口中需高于流量阈值的秒数
+PROBE_VALID_NORMAL=60       # 正常结果缓存有效期 (秒)
+PROBE_VALID_THROTTLED=180   # 限速结果缓存有效期 (秒)
+HIGH_THRESHOLD_PEAK=4       # 高峰时段窗口中需高于流量阈值的秒数
+HIGH_THRESHOLD_OFFPEAK=2    # 低谷时段窗口中需高于流量阈值的秒数
 # 低谷时间: 工作日 1:00~7:00, 周末 2:00~8:00
 DURATION=3                  # wget 下载探测秒数
 TRIG_COOLDOWN=60            # 同类型 TRIG 提示冷却时间(秒)，防止低流量常态下刷屏
@@ -32,20 +42,36 @@ DRY_RUN="${DRY_RUN:-0}"
 MODE="${MODE:-daemon}"
 WINDOW_SAMPLES=$((WINDOW_TIME / SAMPLE_INTERVAL))  # 窗口采样点数
 
-# 受控目标列表: 每行 "type:name"
+# 本机公网 IPv4: 运行时在线获取 (见 get_pubip); 获取失败则回退 PUBIP_FALLBACK(仅当已显式设置)
+# 用于 nftables 排除公网回环虚高
+# PUBIP_FALLBACK 无默认值 —— 必须显式设置, 否则在线获取失败则退出
+PUBIP_FALLBACK="${PUBIP_FALLBACK:-}"
+PUBIP=''   # 运行时由 get_pubip 填充
+NFT_TABLE='inet natmon'
+
+# 受控目标列表: 每行 "type:name" (无默认值, 由 NAT_MON_TARGETS 提供)
 #   systemd -> systemctl stop/start <name>
 #   docker  -> docker stop/start <name>
-#   1pctl   -> 1pctl stop / 1pctl start (name 留空)
-#   x-ui    -> x-ui stop / x-ui start (name 留空)
-TARGETS=(
-  "systemd:nat.service"
-  "systemd:uinetd.service"
-  "systemd:hentaihome.service"
-  "1pctl:"
-  "docker:1Panel-openresty-RoFl"
-  "docker:iptv-rust"
-  "x-ui:"
-)
+#   1pctl   -> 1pctl stop / 1pctl start (name 留空, 即 "1pctl:")
+#   x-ui    -> x-ui stop / x-ui start (name 留空, 即 "x-ui:")
+# 必须通过环境变量 NAT_MON_TARGETS 提供 (无默认值); 未设置则 TARGETS 为空
+if [ -n "${NAT_MON_TARGETS:-}" ]; then
+  TARGETS=()
+  set -f   # 禁用路径名展开, 防止目标名含 * ? 触发 glob
+  for entry in $NAT_MON_TARGETS; do
+    [ -n "$entry" ] && TARGETS+=("$entry")
+  done
+  set +f
+fi
+
+# 限速特例目标: 停止动作不杀进程，改为双向分别限速 (单位 kbit/s)
+#   上行: OUTPUT 打 mark 0x10 经 ifb0 class 1:30 限速
+#   下行: 上行 CONNMARK 保存, eth0 ingress 还原为 mark 0x20 经 ifb0 class 1:31 限速
+#   5KB/s = 40kbit; 若想改回 5kbit ≈ 0.6KB/s
+# 通过环境变量 NAT_MON_LIMIT_TARGET 提供 (留空则关闭该特例, 无默认值)
+LIMIT_TARGET="${NAT_MON_LIMIT_TARGET:-}"
+LIMIT_UP_KBIT="${NAT_MON_LIMIT_KBIT:-40}"
+LIMIT_DOWN_KBIT="${NAT_MON_LIMIT_DOWN_KBIT:-40}"
 
 # ===== 工具探测 =====
 HAS_DOCKER="$(command -v docker >/dev/null 2>&1 && echo 1 || echo 0)"
@@ -74,6 +100,60 @@ PREV_RX=0 PREV_TX=0
 # ===== 工具函数 =====
 log() { echo "$(date '+%F %T') $*" >> "$LOG_FILE"; }
 
+# ===== 在线获取本机公网 IPv4 =====
+# 依次尝试多个端点 (curl 优先, 否则 wget), 提取首个合法 IPv4; 全部失败返回空串
+get_pubip() {
+  local ip ep
+  local eps=(
+    "https://ifconfig.me/ip"
+    "https://ip.sb"
+    "https://api.ipify.org"
+    "https://icanhazip.com"
+    "https://myip.ipip.net"
+  )
+  for ep in "${eps[@]}"; do
+    if command -v curl >/dev/null 2>&1; then
+      ip=$(curl -s --max-time 5 "$ep" 2>/dev/null)
+    elif command -v wget >/dev/null 2>&1; then
+      ip=$(wget -qO- --timeout=5 "$ep" 2>/dev/null)
+    else
+      return 1
+    fi
+    ip=$(printf '%s' "$ip" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+    [ -n "$ip" ] && { printf '%s' "$ip"; return 0; }
+  done
+  return 1
+}
+
+# ===== nftables 真实公网流量计数器 =====
+# 背景: eth0 的 /proc/net/dev 计数含"公网回环"虚高 —— 本机 derper↔tailscaled 经
+#       本机公网 IP 走回环, 数据出又进各计一次, 中继转发量虚增约一倍。
+# 方案: 只统计"非回环"的公网流量:
+#   真实公网入站 = 源 != 本机公网IP  (回环入站的源 = 本机公网IP)
+#   真实公网出站 = 目标 != 本机公网IP (回环出站的目标 = 本机公网IP)
+# 说明: 阿里云网关会把公网 IP 与内网 IP(eth0)互做 NAT, 但回环包在 eth0 上
+#       源/目标仍表现为本机公网IP, 上述两条规则即可精确排除。
+init_nft() {
+  if ! nft list table "$NFT_TABLE" >/dev/null 2>&1; then
+    nft add table "$NFT_TABLE"
+    nft add counter "$NFT_TABLE" in_real
+    nft add counter "$NFT_TABLE" out_real
+    nft add chain "$NFT_TABLE" in "{ type filter hook prerouting priority -200; policy accept; }"
+    nft add chain "$NFT_TABLE" out "{ type filter hook postrouting priority -200; policy accept; }"
+  fi
+  # 幂等重建规则 (counter 累计值保留, 由 init_counters 做基线)
+  nft flush chain "$NFT_TABLE" in 2>/dev/null
+  nft flush chain "$NFT_TABLE" out 2>/dev/null
+  nft add rule "$NFT_TABLE" in iif "$INTERFACE" ip saddr != "$PUBIP" counter name in_real
+  nft add rule "$NFT_TABLE" out oif "$INTERFACE" ip daddr != "$PUBIP" counter name out_real
+}
+
+# 读取 nft 计数器累计字节, 失败返回空串
+nft_get_bytes() {
+  nft list counter "$NFT_TABLE" "$1" 2>/dev/null \
+    | grep -oE 'bytes [0-9]+' | grep -oE '[0-9]+' | head -1
+}
+
 # ===== TRIG 日志冷却抑制 (TRIG_COOLDOWN 秒内同类型只记录一次) =====
 trig_log() {
   local now
@@ -94,6 +174,90 @@ cache_log() {
   fi
 }
 
+# ===== 双向分别限速 (并入 ifb0 CAKE 架构, 完全不动 eth0/fq_pie) =====
+# 前提: cake_qos.sh (SHARED_MODE=true) 已建 ifb0 htb 1: 树 (class 1:10 上行 / 1:20 下行)
+#      且 eth0 入站已重定向到 ifb0 (ingress qdisc 存在)
+# 上行: iptables OUTPUT cgroup 打 mark 0x10 (IPv4+IPv6) → ifb0 prio 0 fw filter → class 1:30
+# 下行: 上行时对 conntrack 做 CONNMARK --save-mark 0x10;
+#       eth0 ingress 用 tc action connmark 还原 → skbedit mark 0x20 → ifb0 class 1:31
+#       (进站 skb 此时尚无 cgroup/skb->sk, xt_cgroup 不可靠, 必须走 connmark)
+tc_limit_bidir() {
+  systemctl start "$LIMIT_TARGET" >/dev/null 2>&1   # 限速≠停止，确保服务在跑
+  if ! tc qdisc show dev ifb0 | grep -q 'htb 1:'; then
+    log "[LIMIT] 错误: ifb0 无 htb 1: 树 (未运行 cake_qos.sh?)，跳过限速"
+    return 1
+  fi
+
+  # ---------- 上行: OUTPUT 打标 + CONNMARK 保存 ----------
+  iptables -t mangle -C OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j MARK --set-mark 0x10 2>/dev/null \
+    || iptables -t mangle -A OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j MARK --set-mark 0x10
+  ip6tables -t mangle -C OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j MARK --set-mark 0x10 2>/dev/null \
+    || ip6tables -t mangle -A OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j MARK --set-mark 0x10
+  # CONNMARK 保存: 让该连接的下行回包能被识别
+  iptables -t mangle -C OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j CONNMARK --save-mark 2>/dev/null \
+    || iptables -t mangle -A OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j CONNMARK --save-mark
+  ip6tables -t mangle -C OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j CONNMARK --save-mark 2>/dev/null \
+    || ip6tables -t mangle -A OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j CONNMARK --save-mark
+
+  # ---------- 下行: eth0 ingress connmark 还原 -> mark 0x20 ----------
+  if tc qdisc show dev "$INTERFACE" | grep -q 'ingress'; then
+    # prio 98: 还原 conntrack mark 到 skb (不终止, 继续走后续 filter)
+    if ! tc filter add dev "$INTERFACE" ingress parent ffff: prio 98 protocol all u32 match u32 0 0 action connmark 2>/dev/null; then
+      log "[LIMIT] 警告: 添加 eth0 ingress connmark 过滤器失败 (缺 act_connmark 模块?), 下行限速可能不生效"
+    fi
+    # prio 99: 还原后 mark==0x10 的连接 -> 改写为 0x20 (仅命中限速连接)
+    tc filter add dev "$INTERFACE" ingress parent ffff: prio 99 protocol all handle 0x10 fw action skbedit mark 0x20 2>/dev/null \
+      || true
+  else
+    log "[LIMIT] 警告: ${INTERFACE} 无 ingress qdisc (cake_qos.sh 未重定向入站?), 下行限速可能不生效"
+  fi
+
+  # ---------- ifb0 双向限速类 ----------
+  # 上行 1:30
+  if tc class show dev ifb0 | grep -q 'class htb 1:30'; then
+    tc class change dev ifb0 classid 1:30 htb rate "${LIMIT_UP_KBIT}kbit" ceil "${LIMIT_UP_KBIT}kbit" burst 8k cburst 8k
+  else
+    tc class add dev ifb0 parent 1:1 classid 1:30 htb rate "${LIMIT_UP_KBIT}kbit" ceil "${LIMIT_UP_KBIT}kbit" burst 8k cburst 8k
+    tc qdisc add dev ifb0 parent 1:30 handle 30: cake besteffort triple-isolate rtt 100ms nat
+  fi
+  tc filter add dev ifb0 protocol ip parent 1:0 prio 0 handle 0x10 fw flowid 1:30 2>/dev/null
+  tc filter add dev ifb0 protocol ipv6 parent 1:0 prio 0 handle 0x10 fw flowid 1:30 2>/dev/null
+  # 下行 1:31
+  if tc class show dev ifb0 | grep -q 'class htb 1:31'; then
+    tc class change dev ifb0 classid 1:31 htb rate "${LIMIT_DOWN_KBIT}kbit" ceil "${LIMIT_DOWN_KBIT}kbit" burst 8k cburst 8k
+  else
+    tc class add dev ifb0 parent 1:1 classid 1:31 htb rate "${LIMIT_DOWN_KBIT}kbit" ceil "${LIMIT_DOWN_KBIT}kbit" burst 8k cburst 8k
+    tc qdisc add dev ifb0 parent 1:31 handle 31: cake besteffort triple-isolate rtt 100ms nat
+  fi
+  tc filter add dev ifb0 protocol ip parent 1:0 prio 0 handle 0x20 fw flowid 1:31 2>/dev/null
+  tc filter add dev ifb0 protocol ipv6 parent 1:0 prio 0 handle 0x20 fw flowid 1:31 2>/dev/null
+
+  log "[LIMIT] 已限 ${LIMIT_TARGET} 上行 ${LIMIT_UP_KBIT}kbit/s / 下行 ${LIMIT_DOWN_KBIT}kbit/s (ifb0 1:30/1:31 cake)"
+}
+
+tc_limit_bidir_clear() {
+  systemctl start "$LIMIT_TARGET" >/dev/null 2>&1   # 恢复启动语义: 确保服务在跑
+  # 上行标记 + connmark
+  iptables -t mangle -D OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j MARK --set-mark 0x10 2>/dev/null
+  ip6tables -t mangle -D OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j MARK --set-mark 0x10 2>/dev/null
+  iptables -t mangle -D OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j CONNMARK --save-mark 2>/dev/null
+  ip6tables -t mangle -D OUTPUT -m cgroup --path "system.slice/${LIMIT_TARGET}" -j CONNMARK --save-mark 2>/dev/null
+  # 下行 eth0 ingress 过滤器 (按 prio 精确删除, 不动 cake_qos.sh 其它规则)
+  tc filter del dev "$INTERFACE" ingress prio 98 2>/dev/null
+  tc filter del dev "$INTERFACE" ingress prio 99 2>/dev/null
+  # ifb0 双向限速类 + fw filter
+  tc filter del dev ifb0 protocol ip parent 1:0 prio 0 handle 0x10 fw 2>/dev/null
+  tc filter del dev ifb0 protocol ipv6 parent 1:0 prio 0 handle 0x10 fw 2>/dev/null
+  tc filter del dev ifb0 protocol ip parent 1:0 prio 0 handle 0x20 fw 2>/dev/null
+  tc filter del dev ifb0 protocol ipv6 parent 1:0 prio 0 handle 0x20 fw 2>/dev/null
+  tc qdisc del dev ifb0 parent 1:30 handle 30: 2>/dev/null
+  tc class del dev ifb0 parent 1:1 classid 1:30 2>/dev/null
+  tc qdisc del dev ifb0 parent 1:31 handle 31: 2>/dev/null
+  tc class del dev ifb0 parent 1:1 classid 1:31 2>/dev/null
+  log "[LIMIT] 已解除 ${LIMIT_TARGET} 双向限速并确保服务运行"
+}
+
+
 # ===== 对单个目标执行 stop/start =====
 apply_one() {
   local action="$1" type="$2" name="$3" rc label
@@ -101,7 +265,14 @@ apply_one() {
   case "$type" in
     systemd)
       systemctl list-unit-files "$name" >/dev/null 2>&1 || { log "[SKIP] 未找到 unit: $name"; return; }
-      if [ "$action" = "stop" ]; then systemctl stop "$name"; else systemctl start "$name"; fi
+      if [ "$name" = "$LIMIT_TARGET" ]; then
+        # 特例: 对应服务不停止，改为双向分别限速 / 恢复时解除限速
+        if [ "$action" = "stop" ]; then tc_limit_bidir; else tc_limit_bidir_clear; fi
+      elif [ "$action" = "stop" ]; then
+        systemctl stop "$name"
+      else
+        systemctl start "$name"
+      fi
       ;;
     1pctl)
       [ -n "$ONEPCTL_BIN" ] || { log "[SKIP] 1pctl 不可用"; return; }
@@ -163,45 +334,46 @@ wget_probe() {
   fi
 }
 
-# ===== 读取本秒流量 (分方向 RX/TX KB/s) =====
-# 注意: 通过全局变量 FLOW_RX / FLOW_TX 返回，不能放在 $() 子shell中调用
+# ===== 读取本秒真实公网流量 (分方向 RX/TX KB/s) =====
+# 数据源: nftables 计数器 in_real (真实公网入站) / out_real (真实公网出站)
+#         已排除本机公网回环, 不再读 /proc/net/dev (含回环虚高)
 read_flow() {
-  local read_line rx_bytes tx_bytes drx dtx
-  read_line=$(grep "^ *${INTERFACE}:" /proc/net/dev 2>/dev/null)
-  if [ -z "$read_line" ]; then
-    FLOW_RX=0; FLOW_TX=0
-    return
+  local cur_in cur_out din dout
+  cur_in=$(nft_get_bytes in_real)
+  cur_out=$(nft_get_bytes out_real)
+  if [ -z "$cur_in" ] || [ -z "$cur_out" ]; then
+    init_nft
+    cur_in=$(nft_get_bytes in_real)
+    cur_out=$(nft_get_bytes out_real)
+    [ -z "$cur_in" ] && cur_in=0
+    [ -z "$cur_out" ] && cur_out=0
   fi
-  rx_bytes=$(echo "$read_line" | awk '{print $2}')
-  tx_bytes=$(echo "$read_line" | awk '{print $10}')
   if [ "$PREV_RX" -eq 0 ] && [ "$PREV_TX" -eq 0 ]; then
-    PREV_RX=$rx_bytes; PREV_TX=$tx_bytes
+    PREV_RX=$cur_in; PREV_TX=$cur_out
     FLOW_RX=0; FLOW_TX=0
     return
   fi
-  drx=$((rx_bytes - PREV_RX))
-  dtx=$((tx_bytes - PREV_TX))
-  PREV_RX=$rx_bytes; PREV_TX=$tx_bytes
-  if [ "$drx" -lt 0 ]; then drx=0; fi
-  if [ "$dtx" -lt 0 ]; then dtx=0; fi
-  FLOW_RX=$(awk -v d="$drx" -v n="$SAMPLE_INTERVAL" 'BEGIN{printf "%.1f", d/1024/n}')
-  FLOW_TX=$(awk -v d="$dtx" -v n="$SAMPLE_INTERVAL" 'BEGIN{printf "%.1f", d/1024/n}')
+  din=$((cur_in - PREV_RX))
+  dout=$((cur_out - PREV_TX))
+  PREV_RX=$cur_in; PREV_TX=$cur_out
+  if [ "$din" -lt 0 ]; then din=0; fi
+  if [ "$dout" -lt 0 ]; then dout=0; fi
+  FLOW_RX=$(awk -v d="$din" -v n="$SAMPLE_INTERVAL" 'BEGIN{printf "%.1f", d/1024/n}')
+  FLOW_TX=$(awk -v d="$dout" -v n="$SAMPLE_INTERVAL" 'BEGIN{printf "%.1f", d/1024/n}')
 }
 
 # ===== 初始化计数器 =====
 init_counters() {
-  local read_line rx_bytes tx_bytes
-  read_line=$(grep "^ *${INTERFACE}:" /proc/net/dev 2>/dev/null)
-  if [ -n "$read_line" ]; then
-    rx_bytes=$(echo "$read_line" | awk '{print $2}')
-    tx_bytes=$(echo "$read_line" | awk '{print $10}')
-    PREV_RX=$rx_bytes; PREV_TX=$tx_bytes
-  fi
+  PREV_RX=$(nft_get_bytes in_real)
+  PREV_TX=$(nft_get_bytes out_real)
+  [ -z "$PREV_RX" ] && PREV_RX=0
+  [ -z "$PREV_TX" ] && PREV_TX=0
 }
 
 # ===== 窗口判断 (传入窗口数组引用名) =====
 win_all_below() {
-  local -n arr="$1"
+  local -n arr
+  arr="$1"
   local v
   [ "${#arr[@]}" -lt "$WINDOW_SAMPLES" ] && return 1
   for v in "${arr[@]}"; do
@@ -213,7 +385,8 @@ win_all_below() {
 }
 
 win_any_above() {
-  local -n arr="$1"
+  local -n arr
+  arr="$1"
   local v
   [ "${#arr[@]}" -lt "$WINDOW_SAMPLES" ] && return 1
   for v in "${arr[@]}"; do
@@ -259,19 +432,21 @@ get_high_threshold() {
 
 # ===== 滑动窗口维护 =====
 push_win() {
-  local -n arr="$1"
+  local -n arr
+  arr="$1"
   local kbps="$2"
   if [ "${#arr[@]}" -lt "$WINDOW_SAMPLES" ]; then
     arr+=("$kbps")
   else
-    arr[$WIN_IDX]="$kbps"
+    arr[WIN_IDX]="$kbps"
   fi
 }
 
 # ===== 窗口统计 (传入数组引用名) =====
 # 结果通过全局 WIN_MIN / WIN_MAX / WIN_AVG 返回
 win_stats() {
-  local -n arr="$1"
+  local -n arr
+  arr="$1"
   local v sum
   WIN_MIN=$(printf '%s\n' "${arr[@]}" | sort -n | head -1)
   WIN_MAX=$(printf '%s\n' "${arr[@]}" | sort -n | tail -1)
@@ -351,7 +526,22 @@ if [ "$MODE" = "start" ]; then
   exit 0
 fi
 
-log "[INFO] daemon 启动 | 网卡=${INTERFACE} | 采样=${SAMPLE_INTERVAL}s | 阈值=${FLOW_THRESHOLD_KBPS} KB/s (分方向) | 窗口=${WINDOW_TIME}s(${WINDOW_SAMPLES}点) | 缓存: 正常=${PROBE_VALID_NORMAL}s 限速=${PROBE_VALID_THROTTLED}s | DRY_RUN=${DRY_RUN}"
+# ===== 在线获取本机公网 IPv4 =====
+PUBIP="$(get_pubip)"
+if [ -z "$PUBIP" ]; then
+  if [ -n "$PUBIP_FALLBACK" ]; then
+    log "[WARN] 在线获取公网IP失败, 回退 PUBIP_FALLBACK=${PUBIP_FALLBACK}"
+    PUBIP="$PUBIP_FALLBACK"
+  else
+    log "[FATAL] 在线获取公网IP失败且未设置 PUBIP_FALLBACK, 无法排除公网回环, 退出"
+    exit 1
+  fi
+else
+  log "[INFO] 在线获取公网IP: ${PUBIP}"
+fi
+
+init_nft
+log "[INFO] daemon 启动 | 网卡=${INTERFACE} | 真实公网流量(nft ${NFT_TABLE}, 排除${PUBIP}回环) | 采样=${SAMPLE_INTERVAL}s | 阈值=${FLOW_THRESHOLD_KBPS} KB/s (分方向) | 窗口=${WINDOW_TIME}s(${WINDOW_SAMPLES}点) | 缓存: 正常=${PROBE_VALID_NORMAL}s 限速=${PROBE_VALID_THROTTLED}s | DRY_RUN=${DRY_RUN}${LIMIT_TARGET:+| 限速特例=${LIMIT_TARGET}(上${LIMIT_UP_KBIT}/下${LIMIT_DOWN_KBIT}kbit)}"
 init_counters
 sleep "$SAMPLE_INTERVAL"   # 先等采样间隔建立初始计数器基线
 
