@@ -1,12 +1,20 @@
 #!/usr/bin/bash
 # =============================================================================
-#  CAKE QoS 双模式脚本
+#  CAKE QoS 双模式脚本 (自动适配隧道接管默认路由版)
 #
 #  SHARED_MODE="true"  → 共享总额模式: clsact 双向重定向 → ifb0 单棵 HTB 树
 #                        上下行通过 ceil 互借带宽，合计不超过 BANDWIDTH_TOTAL
 #
 #  SHARED_MODE="false" → 独立限速模式: eth0 HTB(上行) + ifb0 HTB(下行) 两棵独立树
 #                        上下行各自独立，互不影响
+#
+#  自动适配 (2026-08-27):
+#    1. INTERFACE 检测: 默认路由被隧道接口 (WARP/tailscale/wg/tun) 接管时,
+#       自动回退到物理网卡 (eth*/enp*/ens*/eno*), 避免 clsact 建错接口。
+#    2. 隧道口泛化: 所有隧道接口 (WARP/tailscale/wg/tun) 统一处理:
+#       - 共享模式: 双向重定向到 ifb0 (单树按真实 IP 分上下行类)
+#       - 独立模式: 仅 ingress 重定向到 ifb0 (下行限速);
+#                   上行原始包走 wg 加密 → 物理口 egress 树, 由上行 CAKE 限
 # =============================================================================
 
 # =============================================================================
@@ -18,6 +26,12 @@ SHARED_MODE="false"
 
 # 1. 自动获取默认网卡
 INTERFACE=$(ip route get 223.5.5.5 | grep -Po '(?<=dev )(\S+)')
+# 默认路由被隧道接口接管时, 回退到物理网卡
+case "$INTERFACE" in
+    WARP|tailscale*|wg*|tun*|tap*|utun*)
+        INTERFACE=$(ip -o link show | grep -oP '^\d+: \K(eth\w*|enp\w*|ens\w*|eno\w*)' | head -1)
+        ;;
+esac
 
 # 2. 带宽设置
 #   共享模式 (SHARED_MODE=true) 使用全部三个变量：
@@ -73,14 +87,16 @@ echo "=========================================="
 echo ""
 echo "正在清除现有 tc 规则..."
 
-# 第1步：先删 eth0 的 clsact（切断所有到 ifb0 的重定向，立即恢复网络）
+# 第1步：先删物理口的 clsact（切断所有到 ifb0 的重定向，立即恢复网络）
 tc qdisc del dev "$INTERFACE" clsact   2>/dev/null
 tc qdisc del dev "$INTERFACE" root     2>/dev/null
 tc qdisc del dev "$INTERFACE" ingress  2>/dev/null
 tc -6 qdisc del dev "$INTERFACE" root    2>/dev/null
 tc -6 qdisc del dev "$INTERFACE" ingress 2>/dev/null
-# tailscale0 隧道口同样清除 (若有)
-tc qdisc del dev tailscale0 clsact 2>/dev/null
+# 隧道口同样清除 (WARP/tailscale/wg 等, 若有)
+for tun in $(ip -o link show | grep -oP '^\d+: \K(WARP|tailscale\d*|wg\d*|tun\d*)'); do
+    tc qdisc del dev "$tun" clsact 2>/dev/null
+done
 
 # 第2步：确保 ifb0 是 UP（down 状态下无法删除 qdisc）
 ip link set dev ifb0 up 2>/dev/null
@@ -157,23 +173,22 @@ if [ "$SHARED_MODE" = "true" ]; then
     echo "已添加: $INTERFACE egress → ifb0 (上传流量)"
 
     # =====================================================================
-    # tailscale0 隧道口双向重定向:
-    #   背景: 部分服务经 socks5 走 tailscale 隧道时, 原始流量在 tailscale0
-    #         上进出, 不经过 eth0, 导致 eth0 侧限速不生效
-    #         (外层 UDP 封装属于 tailscaled 进程, cgroup 匹配不到)。
-    #   方案: tailscale0 双向重定向到 ifb0, 原始包带着 iptables OUTPUT 打的
-    #         mark 0x10 进入 ifb0 → 限速 fw filter (pref 1) → 1:30;
-    #         未打 mark 的隧道流量落 default 1:20, 不受限。
+    # 隧道口统一重定向 (2026-08-27 泛化):
+    #   背景: 服务流量经隧道 (WARP/tailscale/wg) 时, 原始流量在隧道口进出,
+    #         不经过物理口, 导致物理口侧限速不生效
+    #         (物理口上只有加密外层封装, 属于隧道进程)。
+    #   方案: 隧道口双向重定向到 ifb0, 原始包带真实 IP 进入 ifb0,
+    #         u32 按 src/dst=公网IP 分上下行类; 未匹配的落 default。
     # =====================================================================
-    if ip link show tailscale0 >/dev/null 2>&1; then
-        tc qdisc add dev tailscale0 clsact 2>/dev/null
-        tc filter add dev tailscale0 ingress protocol all prio 100 matchall \
+    for tun in $(ip -o link show | grep -oP '^\d+: \K(WARP|tailscale\d*|wg\d*|tun\d*)'); do
+        tc qdisc add dev "$tun" clsact 2>/dev/null
+        tc filter add dev "$tun" ingress protocol all prio 100 matchall \
             action mirred egress redirect dev ifb0 2>/dev/null
-        echo "已添加: tailscale0 ingress → ifb0 (隧道入站)"
-        tc filter add dev tailscale0 egress protocol all prio 100 matchall \
+        echo "已添加: $tun ingress → ifb0 (隧道入站)"
+        tc filter add dev "$tun" egress protocol all prio 100 matchall \
             action mirred egress redirect dev ifb0 2>/dev/null
-        echo "已添加: tailscale0 egress → ifb0 (隧道出站)"
-    fi
+        echo "已添加: $tun egress → ifb0 (隧道出站)"
+    done
 
     # ifb0 HTB 树状流控
     tc qdisc add dev ifb0 root handle 1: htb default 20 r2q 100
@@ -228,6 +243,11 @@ else
     #  ├─ 1:1  (1000mbit)              ├─ 2:1  (1000mbit)
     #  │  ├─ 1:10 pfifo (本地绕过)     │  ├─ 2:10 pfifo (本地绕过)
     #  │  └─ 1:30 CAKE ($UP)          │  └─ 2:30 CAKE ($DOWN)
+    #
+    #  隧道口 (WARP/tailscale/wg):
+    #     ingress 重定向 → ifb0 (下行原始流量 → 2:30 下行 CAKE)
+    #     egress 不重定向 (上行原始流量走 wg 加密 → 物理口 egress 树 → 1:30)
+    #     若 egress 也重定向, 上行会混进 ifb0 下行树, 破坏独立限速。
     # =====================================================================
 
     # ---------- 上行 (egress) — eth0 ----------
@@ -265,6 +285,19 @@ else
     tc filter add dev $INTERFACE parent ffff: protocol all prio 10 u32 \
         match u32 0 0 action mirred egress redirect dev ifb0
     echo "已添加: $INTERFACE ingress → ifb0 (下载流量)"
+    # =====================================================================
+    # 隧道口 ingress 重定向 (2026-08-27 泛化):
+    #   背景: 隧道原始下行流量在隧道口 ingress 出现 (加密前), 不进物理口,
+    #         物理口 ingress 只有加密封装, 限速粒度一致但无法按真实 IP 分流。
+    #   方案: 隧道口 ingress 重定向 → ifb0 2:30 下行 CAKE (default 兜底)。
+    #         egress 不重定向: 上行由物理口 egress 树 1:30 限速。
+    # =====================================================================
+    for tun in $(ip -o link show | grep -oP '^\d+: \K(WARP|tailscale\d*|wg\d*|tun\d*)'); do
+        tc qdisc add dev "$tun" clsact 2>/dev/null
+        tc filter add dev "$tun" ingress protocol all prio 100 matchall \
+            action mirred egress redirect dev ifb0 2>/dev/null
+        echo "已添加: $tun ingress → ifb0 (隧道下行限速)"
+    done
 
     # ifb0 HTB 下行限速
     tc qdisc add dev ifb0 root handle 2: htb default 30 r2q 100
@@ -309,6 +342,13 @@ echo ""
 echo "--- egress filters ---"
 tc filter show dev $INTERFACE egress 2>/dev/null
 
+for tun in $(ip -o link show | grep -oP '^\d+: \K(WARP|tailscale\d*|wg\d*|tun\d*)'); do
+    echo ""
+    echo "========== $tun =========="
+    tc -s qdisc show dev "$tun"
+    echo "--- ingress filters ---"
+    tc filter show dev "$tun" ingress 2>/dev/null
+done
 echo ""
 echo "========== ifb0 =========="
 tc -s qdisc show dev ifb0
