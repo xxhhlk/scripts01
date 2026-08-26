@@ -6,3 +6,6 @@
 ## 2. gen_reject_handshake.sh
 
 #### 这个是给暂时不方便 / 懒得升级 1Panel 到 V2 用的（V2 已经自带这个功能了），自动扫描 1Panel OpenResty 网站配置中所有 `listen ... ssl` 的端口，为每个端口生成一份 `ssl_reject_handshake` 兜底配置，并热重载 OpenResty，隐藏直接用 IP 访问时泄露的真实证书。
+## 3. cake_qos.sh
+
+#### CAKE 双模式 QoS 脚本：基于 tc/HTB + cake 的共享总额或独立限速方案，支持 eth0 与 tailscale0 隧道双向重定向限速，可配合 cgroup mark 做单服务限速。
