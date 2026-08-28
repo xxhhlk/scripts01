@@ -202,13 +202,13 @@ if [ "$SHARED_MODE" = "true" ]; then
     tc class add dev ifb0 parent 1:1 classid 1:10 htb \
         rate $BANDWIDTH_UP ceil $BANDWIDTH_TOTAL prio 0 \
         burst 40k cburst 40k
-    tc qdisc add dev ifb0 parent 1:10 handle 10: cake besteffort triple-isolate rtt 100ms nat
+    tc qdisc add dev ifb0 parent 1:10 handle 10: cake besteffort triple-isolate rtt 300ms nat
 
     # 下行子类 (1:20): 保底 → 可借用至总额
     tc class add dev ifb0 parent 1:1 classid 1:20 htb \
         rate $BANDWIDTH_DOWN ceil $BANDWIDTH_TOTAL prio 1 \
         burst 40k cburst 40k
-    tc qdisc add dev ifb0 parent 1:20 handle 20: cake besteffort triple-isolate rtt 100ms nat
+    tc qdisc add dev ifb0 parent 1:20 handle 20: cake besteffort triple-isolate rtt 300ms nat
 
     # 过滤规则：在 ifb0 内按 IP 方向分流
     # (pref 11-14, 让出 pref 1-4 给限速 fw filter)
@@ -264,7 +264,7 @@ else
     # 普通流量，走 CAKE 限速
     tc class add dev $INTERFACE parent 1:1 classid 1:30 htb \
         rate $BANDWIDTH_UP ceil $BANDWIDTH_UP prio 1 burst 32k cburst 32k
-    tc qdisc add dev $INTERFACE parent 1:30 handle 30: cake besteffort triple-isolate rtt 100ms nat
+    tc qdisc add dev $INTERFACE parent 1:30 handle 30: cake besteffort triple-isolate rtt 300ms nat
     echo "已添加上行 CAKE: eth0 限速 $BANDWIDTH_UP"
 
     # 上行过滤规则：仅 dst=公网IP 的包是本地自通信（VPS→自身），绕过 CAKE
@@ -313,7 +313,7 @@ else
     # 普通流量，走 CAKE 限速
     tc class add dev ifb0 parent 2:1 classid 2:30 htb \
         rate $BANDWIDTH_DOWN ceil $BANDWIDTH_DOWN prio 1 burst 32k cburst 32k
-    tc qdisc add dev ifb0 parent 2:30 handle 30: cake besteffort triple-isolate rtt 100ms nat
+    tc qdisc add dev ifb0 parent 2:30 handle 30: cake besteffort triple-isolate rtt 300ms nat
     echo "已添加下行 CAKE: ifb0 限速 $BANDWIDTH_DOWN"
 
     # 下行过滤规则：仅 src=公网IP 的包是本地自通信（VPS→自身），绕过 CAKE
