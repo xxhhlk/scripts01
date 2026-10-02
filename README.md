@@ -9,3 +9,7 @@
 ## 3. cake_qos.sh
 
 #### CAKE 双模式 QoS 脚本：基于 tc/HTB + cake 的共享总额或独立限速方案，支持 eth0 与 tailscale0 隧道双向重定向限速，可配合 cgroup mark 做单服务限速。
+
+## 4. cold_read_check.py | cold_tiny_check.py
+#### cold_read_check.py：只读诊断 SSD 冷数据掉速 —— FILE_FLAG_NO_BUFFERING 直读绕页缓存 + 参考文件归一化 + 同体积档基准，全程零写入目标盘。（参考了 https://github.com/infrost/ColDataRefresh 感谢）
+#### cold_tiny_check.py 小文件专用 —— 用 4KB 随机读延迟分布（而非吞吐）对比冷/暖组，绕开"读取量被文件大小锁死"的死结
